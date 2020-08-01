@@ -22,6 +22,7 @@
 
 #import <arpa/inet.h>
 #import <sys/ioctl.h>
+#import <sys/time.h>
 
 struct dplus_authentication_request {
     char length;
@@ -144,7 +145,7 @@ static const unsigned long long NSEC_PER_HOUR = 3600ull * NSEC_PER_SEC;
     if(!self.authCall)
         return;
     
-    int authSocket = socket(PF_INET, SOCK_STREAM, 0);
+    int authSocket = socket(AF_INET, SOCK_STREAM, 0);
     if(authSocket == -1) {
         NSLog(@"Couldn't create socket: %s", strerror(errno));
         return;
@@ -164,11 +165,20 @@ static const unsigned long long NSEC_PER_HOUR = 3600ull * NSEC_PER_SEC;
         NSLog(@"Cannot lookup auth.dstargateway.org");
         return;
     }
-    
+
+    // Test ability to make this call before the loop
+    if ( fcntl(authSocket, F_GETFL, NULL) < 0 ) {
+        NSLog(@"Error fcntl(..., F_GETFL) (%s)\n", strerror(errno));
+        return;
+    }
+
     bool connected = NO;
     for(NSData *addressData in addresses) {
         struct sockaddr_in *dNSAddr = (struct sockaddr_in *)[addressData bytes];
         char *addressString = inet_ntoa(dNSAddr->sin_addr);
+        int fcntls;
+        fd_set fdset;
+        struct timeval timeout;
 
         NSLog(@"Trying to connect to D-Plus authentication server at %s", addressString);
         struct sockaddr_in addr = {
@@ -177,20 +187,49 @@ static const unsigned long long NSEC_PER_HOUR = 3600ull * NSEC_PER_SEC;
             .sin_port = htons(20001),
             .sin_addr.s_addr = dNSAddr->sin_addr.s_addr
         };
-        
-        if(connect(authSocket, (const struct sockaddr *) &addr, (socklen_t) sizeof(addr)) == -1) {
+
+        /* Set to non-blocking mode */
+        fcntls = fcntl(authSocket, F_GETFL, NULL);
+        fcntls |= O_NONBLOCK;
+        fcntl(authSocket, F_SETFL, fcntls);
+
+        connect(authSocket, (struct sockaddr *)&addr, sizeof(addr));
+
+        FD_ZERO(&fdset);
+        FD_SET(authSocket, &fdset);
+
+        // 5 s timeout (default is 75 s ... way too long)
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+
+        if ( select(authSocket + 1, NULL, &fdset, NULL, &timeout) == 1 ) {
+            int so_error;
+            socklen_t len = sizeof(so_error);
+
+            getsockopt(authSocket, SOL_SOCKET, SO_ERROR, &so_error, &len);
+
+            if (so_error == 0) {
+                connected = YES;
+            }
+        }
+
+        /* Set back to blocking mode */
+        fcntls = fcntl(authSocket, F_GETFL, NULL);
+        fcntls &= (~O_NONBLOCK);
+        fcntl(authSocket, F_SETFL, fcntls);
+
+        if (connected) {
+            NSLog(@"Connected to %s\n", addressString);
+            break;
+        } else {
             NSLog(@"Couldn't connect to %s: %s\n", addressString, strerror(errno));
             close(authSocket);
-            
-            authSocket = socket(PF_INET, SOCK_STREAM, 0);
+
+            authSocket = socket(AF_INET, SOCK_STREAM, 0);
             if(authSocket == -1) {
                 NSLog(@"Couldn't create socket: %s", strerror(errno));
                 return;
             }
-        } else {
-            NSLog(@"Connected to D-Plus authentication server at %s", addressString);
-            connected = YES;
-            break;
         }
     }
     
